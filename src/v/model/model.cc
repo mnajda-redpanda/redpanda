@@ -10,6 +10,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
+#include "base/vlog.h"
 #include "bytes/bytes.h"
 #include "bytes/iobuf.h"
 #include "bytes/iobuf_parser.h"
@@ -26,6 +27,8 @@
 #include "strings/string_switch.h"
 #include "utils/base64.h"
 #include "utils/to_string.h"
+
+#include <seastar/util/log.hh>
 
 #include <fmt/ostream.h>
 
@@ -616,111 +619,386 @@ std::istream& operator>>(std::istream& is, recovery_validation_mode& vm) {
     return is;
 }
 
-iceberg_mode iceberg_mode::disabled
-  = iceberg_mode::make<iceberg_mode::variant::disabled>();
-iceberg_mode iceberg_mode::key_value
-  = iceberg_mode::make<iceberg_mode::variant::key_value>();
-iceberg_mode iceberg_mode::value_schema_id_prefix
-  = iceberg_mode::make<iceberg_mode::variant::value_schema_id_prefix>();
+iceberg_mode iceberg_mode::disabled = iceberg_mode{};
+iceberg_mode iceberg_mode::key_value = iceberg_mode{enabled_impl{}};
+iceberg_mode iceberg_mode::value_schema_id_prefix = []() {
+    enabled_impl e{};
+    e.value.mode = iceberg_mode::schema_mode::schema_id_prefix;
+    return iceberg_mode{std::move(e)};
+}();
+
+static ss::logger iceberg_mode_log("iceberg_mode");
+
+// Wire format discriminants. Values 0-3 are the legacy per-variant
+// discriminants preserved for backward compatibility. Value 4 is the new
+// generic encoding for configs that cannot be expressed in the old format
+// (i.e. key.mode != binary or headers.value_type != binary).
+namespace {
+// The discriminant is serialized as int32_t (serde_enum_serialized_t) to
+// maintain backward compatibility with the original iceberg_mode::variant enum
+// encoding, which used serde::write on an enum class and thus wrote int32_t.
+constexpr int32_t wire_disabled = 0;
+constexpr int32_t wire_key_value = 1;
+constexpr int32_t wire_value_schema_id_prefix = 2;
+constexpr int32_t wire_value_schema_latest = 3;
+constexpr int32_t wire_key_and_value_schema = 4;
+
+constexpr std::string_view to_sv(iceberg_mode::schema_mode m) {
+    switch (m) {
+    case iceberg_mode::schema_mode::binary:
+        return "binary";
+    case iceberg_mode::schema_mode::schema_id_prefix:
+        return "schema_id_prefix";
+    case iceberg_mode::schema_mode::schema_latest:
+        return "schema_latest";
+    }
+    return "unknown";
+}
+
+constexpr std::string_view to_sv(iceberg_mode::header_value_type t) {
+    switch (t) {
+    case iceberg_mode::header_value_type::binary:
+        return "binary";
+    case iceberg_mode::header_value_type::string:
+        return "string";
+    }
+    return "unknown";
+}
+
+// Parse "opt1=val1,opt2=val2" into a map, enforcing no duplicate keys and no
+// empty keys or values. An empty string returns an empty map (all defaults).
+std::optional<absl::flat_hash_map<std::string, std::string>>
+parse_section_opts(std::string_view str) {
+    absl::flat_hash_map<std::string, std::string> result;
+    if (str.empty()) {
+        return result;
+    }
+    for (std::string_view pair : absl::StrSplit(str, ",")) {
+        auto [it, inserted] = result.insert(
+          absl::StrSplit(pair, absl::MaxSplits("=", 1)));
+        if (!inserted) {
+            return std::nullopt; // duplicate key
+        }
+        if (it->first.empty() || it->second.empty()) {
+            return std::nullopt; // empty key or value
+        }
+    }
+    return result;
+}
+
+// Parse the new section-based grammar:
+//   <section> (";" <section>)*
+//   <section> ::= ("key"|"value"|"headers") ":" <opts>
+//
+// Unknown sections and unknown option keys are warned and skipped for forward
+// compatibility. Duplicate sections or duplicate option keys are parse errors.
+// Returns std::nullopt on hard parse error.
+std::optional<iceberg_mode> parse_new_format(std::string_view str) {
+    iceberg_mode::enabled_impl result{};
+    bool seen_key = false, seen_value = false, seen_headers = false;
+    // Names of unknown sections seen, for duplicate detection.
+    std::vector<std::string_view> seen_unknown;
+
+    for (std::string_view sec_str : absl::StrSplit(str, ";")) {
+        if (sec_str.empty()) {
+            return std::nullopt;
+        }
+        auto colon = sec_str.find(':');
+        if (colon == std::string_view::npos) {
+            return std::nullopt;
+        }
+        auto sec_name = sec_str.substr(0, colon);
+        auto opts_str = sec_str.substr(colon + 1);
+
+        auto opts = parse_section_opts(opts_str);
+        if (!opts) {
+            return std::nullopt;
+        }
+
+        auto parse_schema_opts = [&](auto& cfg) -> bool {
+            for (const auto& [k, v] : *opts) {
+                if (k == "mode") {
+                    using sm = iceberg_mode::schema_mode;
+                    auto m = string_switch<std::optional<sm>>(v)
+                               .match("binary", sm::binary)
+                               .match("schema_id_prefix", sm::schema_id_prefix)
+                               .match("schema_latest", sm::schema_latest)
+                               .default_match(std::nullopt);
+                    if (!m) {
+                        return false;
+                    }
+                    cfg.mode = *m;
+                } else if (k == "subject") {
+                    cfg.subject = ss::sstring(v);
+                } else if (k == "protobuf_name") {
+                    cfg.protobuf_name = ss::sstring(v);
+                } else {
+                    vlog(
+                      iceberg_mode_log.warn,
+                      "Unknown iceberg_mode option '{}' in section '{}', "
+                      "ignoring",
+                      k,
+                      sec_name);
+                }
+            }
+            if (
+              cfg.mode != iceberg_mode::schema_mode::schema_latest
+              && (!cfg.subject.empty() || !cfg.protobuf_name.empty())) {
+                return false;
+            }
+            return true;
+        };
+
+        if (sec_name == "key") {
+            if (seen_key) {
+                return std::nullopt; // duplicate section
+            }
+            seen_key = true;
+            if (!parse_schema_opts(result.key)) {
+                return std::nullopt;
+            }
+        } else if (sec_name == "value") {
+            if (seen_value) {
+                return std::nullopt; // duplicate section
+            }
+            seen_value = true;
+            if (!parse_schema_opts(result.value)) {
+                return std::nullopt;
+            }
+        } else if (sec_name == "headers") {
+            if (seen_headers) {
+                return std::nullopt; // duplicate section
+            }
+            seen_headers = true;
+
+            for (const auto& [k, v] : *opts) {
+                if (k == "value_type") {
+                    using hvt = iceberg_mode::header_value_type;
+                    auto t = string_switch<std::optional<hvt>>(v)
+                               .match("binary", hvt::binary)
+                               .match("string", hvt::string)
+                               .default_match(std::nullopt);
+                    if (!t) {
+                        return std::nullopt;
+                    }
+                    result.headers.value_type = *t;
+                } else {
+                    vlog(
+                      iceberg_mode_log.warn,
+                      "Unknown iceberg_mode option '{}' in section 'headers', "
+                      "ignoring",
+                      k);
+                }
+            }
+        } else {
+            auto dup = std::ranges::find(seen_unknown, sec_name);
+            if (dup != seen_unknown.end()) {
+                return std::nullopt; // duplicate unknown section
+            }
+            seen_unknown.push_back(sec_name);
+            vlog(
+              iceberg_mode_log.warn,
+              "Unknown iceberg_mode section '{}', ignoring",
+              sec_name);
+        }
+    }
+    if (!seen_key && !seen_value && !seen_headers) {
+        return std::nullopt;
+    }
+    return iceberg_mode{std::move(result)};
+}
+} // namespace
 
 void write_nested(iobuf& out, const iceberg_mode& m) {
     using serde::write;
-    write(out, m.kind());
-    if (m.kind() == iceberg_mode::variant::value_schema_latest) {
-        write(out, m.protobuf_full_name().value_or(""));
-        write(out, m.subject_name().value_or(""));
+    if (m.is_disabled()) {
+        write(out, wire_disabled);
+        return;
     }
+    const auto& e = std::get<iceberg_mode::enabled_impl>(m._impl);
+    // Configs where key.mode==binary and headers.value_type==binary can be
+    // expressed with the old wire discriminants so that old nodes can read
+    // them.
+    if (
+      e.key.mode == iceberg_mode::schema_mode::binary
+      && e.headers.value_type == iceberg_mode::header_value_type::binary) {
+        switch (e.value.mode) {
+        case iceberg_mode::schema_mode::binary:
+            write(out, wire_key_value);
+            return;
+        case iceberg_mode::schema_mode::schema_id_prefix:
+            write(out, wire_value_schema_id_prefix);
+            return;
+        case iceberg_mode::schema_mode::schema_latest:
+            write(out, wire_value_schema_latest);
+            write(out, e.value.protobuf_name);
+            write(out, e.value.subject);
+            return;
+        }
+    }
+    // New discriminant 4: write full section configs.
+    write(out, wire_key_and_value_schema);
+    write(out, e.key.mode);
+    write(out, e.key.subject);
+    write(out, e.key.protobuf_name);
+    write(out, e.value.mode);
+    write(out, e.value.subject);
+    write(out, e.value.protobuf_name);
+    write(out, e.headers.value_type);
 }
 
 void read_nested(
   iobuf_parser& in, iceberg_mode& m, const std::size_t bytes_left_limit) {
     using serde::read_nested;
-    iceberg_mode::variant v = iceberg_mode::variant::disabled;
-    read_nested(in, v, bytes_left_limit);
-    switch (v) {
-    case iceberg_mode::variant::disabled:
+    int32_t disc = 0;
+    read_nested(in, disc, bytes_left_limit);
+    switch (disc) {
+    case wire_disabled:
         m = iceberg_mode::disabled;
         return;
-    case iceberg_mode::variant::key_value:
+    case wire_key_value:
         m = iceberg_mode::key_value;
         return;
-    case iceberg_mode::variant::value_schema_id_prefix:
+    case wire_value_schema_id_prefix:
         m = iceberg_mode::value_schema_id_prefix;
         return;
-    case iceberg_mode::variant::value_schema_latest:
-        ss::sstring msg_name;
-        read_nested(in, msg_name, bytes_left_limit);
+    case wire_value_schema_latest: {
+        ss::sstring proto_name;
         ss::sstring subject;
+        read_nested(in, proto_name, bytes_left_limit);
         read_nested(in, subject, bytes_left_limit);
-        m = iceberg_mode::value_schema_latest(msg_name, subject);
+        m = iceberg_mode::value_schema_latest(proto_name, subject);
         return;
     }
+    case wire_key_and_value_schema: {
+        iceberg_mode::enabled_impl e{};
+        read_nested(in, e.key.mode, bytes_left_limit);
+        read_nested(in, e.key.subject, bytes_left_limit);
+        read_nested(in, e.key.protobuf_name, bytes_left_limit);
+        read_nested(in, e.value.mode, bytes_left_limit);
+        read_nested(in, e.value.subject, bytes_left_limit);
+        read_nested(in, e.value.protobuf_name, bytes_left_limit);
+        read_nested(in, e.headers.value_type, bytes_left_limit);
+        m = iceberg_mode{std::move(e)};
+        return;
+    }
+    }
     throw serde::serde_exception(
-      fmt::format("unknown iceberg_mode variant: {}", std::to_underlying(v)));
+      fmt::format("unknown iceberg_mode discriminant: {}", disc));
 }
 
 fmt::iterator iceberg_mode::format_to(fmt::iterator it) const {
-    switch (kind()) {
-    case variant::disabled:
+    if (is_disabled()) {
         return fmt::format_to(it, "disabled");
-    case variant::key_value:
-        return fmt::format_to(it, "key_value");
-    case variant::value_schema_id_prefix:
-        return fmt::format_to(it, "value_schema_id_prefix");
-    case variant::value_schema_latest:
-        it = fmt::format_to(it, "value_schema_latest");
-        bool delimiter = false;
-        auto emit_delimiter = [&delimiter, &it]() {
-            it = fmt::format_to(it, "{}", delimiter ? "," : ":");
-            delimiter = true;
-        };
-        if (auto pname = protobuf_full_name()) {
-            emit_delimiter();
-            it = fmt::format_to(it, "protobuf_name={}", pname.value());
-        }
-        if (auto subj = subject_name()) {
-            emit_delimiter();
-            it = fmt::format_to(it, "subject={}", subj.value());
-        }
-        return it;
     }
+    const auto& e = std::get<enabled_impl>(_impl);
+
+    // If key.mode==binary and headers.value_type==binary the config is
+    // expressible as a legacy string; prefer that for maximal compatibility.
+    if (
+      e.key.mode == schema_mode::binary
+      && e.headers.value_type == header_value_type::binary) {
+        switch (e.value.mode) {
+        case schema_mode::binary:
+            return fmt::format_to(it, "key_value");
+        case schema_mode::schema_id_prefix:
+            return fmt::format_to(it, "value_schema_id_prefix");
+        case schema_mode::schema_latest:
+            it = fmt::format_to(it, "value_schema_latest");
+            bool delim = false;
+            auto emit = [&]() {
+                it = fmt::format_to(it, "{}", delim ? "," : ":");
+                delim = true;
+            };
+            if (!e.value.protobuf_name.empty()) {
+                emit();
+                it = fmt::format_to(
+                  it, "protobuf_name={}", e.value.protobuf_name);
+            }
+            if (!e.value.subject.empty()) {
+                emit();
+                it = fmt::format_to(it, "subject={}", e.value.subject);
+            }
+            return it;
+        }
+    }
+
+    // New section-based format. Only emit sections that differ from defaults.
+    bool any = false;
+    auto sep = [&]() {
+        if (any) {
+            it = fmt::format_to(it, ";");
+        }
+        any = true;
+    };
+
+    auto emit_schema_section = [&](std::string_view name, const auto& cfg) {
+        if (cfg.mode == schema_mode::binary) {
+            return; // all defaults, omit
+        }
+        sep();
+        it = fmt::format_to(it, "{}:mode={}", name, to_sv(cfg.mode));
+        if (!cfg.subject.empty()) {
+            it = fmt::format_to(it, ",subject={}", cfg.subject);
+        }
+        if (!cfg.protobuf_name.empty()) {
+            it = fmt::format_to(it, ",protobuf_name={}", cfg.protobuf_name);
+        }
+    };
+
+    emit_schema_section("key", e.key);
+    emit_schema_section("value", e.value);
+
+    if (e.headers.value_type != header_value_type::binary) {
+        sep();
+        it = fmt::format_to(
+          it, "headers:value_type={}", to_sv(e.headers.value_type));
+    }
+
     return it;
 }
 
 namespace {
-// Parse configuration options for iceberg_mode's value_schema_latest, which
-// is a grammar like: `:(<name>=<value>)+`
-std::optional<absl::flat_hash_map<std::string, std::string>>
-parse_config_options(std::string_view str) {
-    if (str.empty()) {
-        return absl::flat_hash_map<std::string, std::string>{};
+// Parse the legacy value_schema_latest options string (everything after the
+// "value_schema_latest" prefix), which has the grammar `:(<name>=<value>)*`.
+std::optional<iceberg_mode>
+parse_legacy_schema_latest(std::string_view suffix) {
+    if (suffix.empty()) {
+        return iceberg_mode::value_schema_latest("", "");
     }
-    if (!absl::ConsumePrefix(&str, ":")) {
+    if (!absl::ConsumePrefix(&suffix, ":")) {
         return std::nullopt;
     }
-    if (str.empty()) {
+    if (suffix.empty()) {
         return std::nullopt;
     }
-    absl::flat_hash_map<std::string, std::string> result;
-    for (std::string_view pair : absl::StrSplit(str, ",")) {
-        auto [it, inserted] = result.insert(
+    absl::flat_hash_map<std::string, std::string> opts;
+    for (std::string_view pair : absl::StrSplit(suffix, ",")) {
+        auto [it, inserted] = opts.insert(
           absl::StrSplit(pair, absl::MaxSplits("=", 1)));
-        // Don't allow duplicates
-        if (!inserted) {
-            return std::nullopt;
-        }
-        // Don't allow empty keys or values
-        if (it->first.empty() || it->second.empty()) {
+        if (!inserted || it->first.empty() || it->second.empty()) {
             return std::nullopt;
         }
     }
-    return result;
+    std::string_view proto_name;
+    std::string_view subject;
+    for (const auto& [k, v] : opts) {
+        if (k == "protobuf_name") {
+            proto_name = v;
+        } else if (k == "subject") {
+            subject = v;
+        } else {
+            return std::nullopt; // unknown key in legacy format is an error
+        }
+    }
+    return iceberg_mode::value_schema_latest(proto_name, subject);
 }
 } // namespace
 
 std::istream& operator>>(std::istream& is, iceberg_mode& mode) {
     ss::sstring s;
     is >> s;
+    // Old-format detection: well-known legacy tokens are handled first.
     if (s == "disabled") {
         mode = iceberg_mode::disabled;
     } else if (s == "key_value") {
@@ -728,27 +1006,21 @@ std::istream& operator>>(std::istream& is, iceberg_mode& mode) {
     } else if (s == "value_schema_id_prefix") {
         mode = iceberg_mode::value_schema_id_prefix;
     } else if (s.starts_with("value_schema_latest")) {
-        s = s.substr(std::strlen("value_schema_latest"));
-        auto options = parse_config_options(s);
-        if (!options.has_value()) {
+        auto result = parse_legacy_schema_latest(
+          std::string_view(s).substr(std::strlen("value_schema_latest")));
+        if (!result) {
             is.setstate(std::ios::failbit);
             return is;
         }
-        std::string_view protobuf_name;
-        std::string_view subject;
-        for (const auto& [key, value] : options.value()) {
-            if (key == "protobuf_name") {
-                protobuf_name = value;
-            } else if (key == "subject") {
-                subject = value;
-            } else {
-                is.setstate(std::ios::failbit);
-                return is;
-            }
-        }
-        mode = iceberg_mode::value_schema_latest(protobuf_name, subject);
+        mode = std::move(*result);
     } else {
-        is.setstate(std::ios::failbit);
+        // New section-based format.
+        auto result = parse_new_format(s);
+        if (!result) {
+            is.setstate(std::ios::failbit);
+            return is;
+        }
+        mode = std::move(*result);
     }
     return is;
 }
